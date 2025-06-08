@@ -25,11 +25,11 @@ To compute the Finsler Multi-Dimensional Scaling embedding on a (asymetric) squa
 
 ```
 embedding, _ = _mds_finsler.smacof(
-            D, 
-            randers_w_alpha=alpha, 
-            metric=True,
-            n_components=proj_dim,
-        )
+    D, 
+    randers_w_alpha=alpha, 
+    metric=True,
+    n_components=proj_dim,
+)
 ```
 
 where `alpha` is the magnitude $\alpha$ of the Randers drift component of the `proj_dim`-dimensional canonical Randers space for the embedding: $\omega = (0,\ldots, 0,\alpha)^\top$. Other options are available (initialisation, stopping criteria, non-uniform weights...).
