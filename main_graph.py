@@ -216,8 +216,7 @@ def main_binary_tree():
     elif init_strat == 'isomap_with_rand': # Noise added because isomap has collapsed the points
         init = (proj + np.random.randn(n, proj_dim) * 0.1) # @ np.array([[0, 1], [-1, 0]])  # Rotate x to y and y to -x
     unif_weights = np.ones_like(dists)
-    # proj_smacof_f_unif, _ = _mds_finsler.smacof(
-    proj_smacof_f_unif, _ = _mds_finsler_graph_debug.smacof(
+    proj_smacof_f_unif, _ = _mds_finsler.smacof(
         dists, randers_w_alpha=randers_w_alpha_embedding, metric=True,
         init=init, n_components=proj_dim, n_init=1, n_jobs=1,
         weight=unif_weights*1., max_iter=500,

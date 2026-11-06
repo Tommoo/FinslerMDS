@@ -1,25 +1,142 @@
+"""Corrected metric Finsler SMACOF, adapted from scikit-learn's _mds.py.
+
+See Appendix C of Dagès, Weber, Cremers and Kimmel, *Harnessing Data
+Asymmetry in Manifold Learning* (NeurIPS 2026).
+
+The public ``smacof`` function runs ``_smacof_single`` once per initialization,
+selects the minimum-stress result, and returns (embedding, stress) by default,
+or (embedding, stress, n_iter) when ``return_n_iter=True``.
+
+For symmetric pair weights W, the update is
+
+    Y_new = V^+ @ (B(Y) @ Y - C/2) @ (I + omega omega.T)^(-1),
+
+where V = diag(W @ 1) - W, omega = (0, ..., 0, alpha), B is built from
+the *symmetric part* of the directed dissimilarities and
+C = (W * (D - D.T)) @ 1 @ omega.T.
+
+For uniform off-diagonal weights w, the left multiplication by V^+ reduces
+exactly to division by n*w, without forming a pseudoinverse. For other
+weights the n-by-n Laplacian pseudoinverse is computed once per smacof call,
+and reused for all restarts and iterations. There is no Kronecker product,
+GMRES, CG, or matrix vectorization.
+"""
+
+from __future__ import annotations
 
 import warnings
-from numbers import Integral, Real
 
 import numpy as np
-from joblib import effective_n_jobs
-
-from sklearn.base import BaseEstimator, _fit_context
-from sklearn.isotonic import IsotonicRegression
+from joblib import Parallel, delayed, effective_n_jobs
 from sklearn.metrics import euclidean_distances
-from sklearn.utils import check_array, check_random_state, check_symmetric
-from sklearn.utils._param_validation import Hidden, Interval, StrOptions, validate_params
-from sklearn.utils.parallel import Parallel, delayed
+from sklearn.utils import check_random_state
 
-from utils import canonical_randers_dissimilarity
-import time
-import scipy
+
+def _validate_dissimilarities(dissimilarities):
+    D = np.asarray(dissimilarities, dtype=float)
+    if D.ndim != 2 or D.shape[0] == 0 or D.shape[0] != D.shape[1]:
+        raise ValueError("dissimilarities must be a nonempty square matrix")
+    if not np.all(np.isfinite(D)) or np.any(D < 0):
+        raise ValueError("dissimilarities must be finite and nonnegative")
+    if not np.allclose(np.diag(D), 0.0, rtol=0, atol=1e-12):
+        raise ValueError("dissimilarities must have a zero diagonal")
+    D = D.copy()
+    np.fill_diagonal(D, 0.0)
+    return D
+
+
+def _validate_weights(weight, n_samples):
+    if weight is None:
+        W = np.ones((n_samples, n_samples), dtype=float)
+    else:
+        W = np.asarray(weight, dtype=float)
+        if W.shape != (n_samples, n_samples):
+            raise ValueError("weight must have shape (n_samples, n_samples)")
+        if not np.all(np.isfinite(W)) or np.any(W < 0):
+            raise ValueError("weight must be finite and nonnegative")
+        if not np.allclose(W, W.T, rtol=1e-12, atol=1e-14):
+            raise ValueError("weight must be symmetric for the corrected update")
+        W = 0.5 * (W + W.T)
+    W = W.copy()
+    # Several original demos pass np.ones_like(D), including its diagonal.
+    # Self-pairs have zero stress and must have zero Laplacian contribution.
+    np.fill_diagonal(W, 0.0)
+    return W
+
+
+def _validate_options(randers_w_alpha, metric, normalized_stress,
+                      n_components, max_iter, eps):
+    if not np.isscalar(randers_w_alpha) or not np.isfinite(randers_w_alpha):
+        raise ValueError("randers_w_alpha must be a finite scalar")
+    if not 0 <= randers_w_alpha < 1:
+        raise ValueError("randers_w_alpha must satisfy 0 <= alpha < 1")
+    if not metric:
+        raise ValueError("Non-metric Finsler MDS is not implemented")
+    if isinstance(normalized_stress, str):
+        if normalized_stress not in ("warn", "auto"):
+            raise ValueError("unknown normalized_stress option")
+        normalized_stress = False  # Historic values for metric MDS.
+    if not isinstance(normalized_stress, (bool, np.bool_)) or normalized_stress:
+        raise ValueError("normalized_stress=True is unsupported for metric Finsler MDS")
+    if not isinstance(n_components, (int, np.integer)) or n_components < 1:
+        raise ValueError("n_components must be a positive integer")
+    if not isinstance(max_iter, (int, np.integer)) or max_iter < 1:
+        raise ValueError("max_iter must be a positive integer")
+    if not np.isscalar(eps) or not np.isfinite(eps) or eps < 0:
+        raise ValueError("eps must be finite and nonnegative")
+
+
+def _warn_obsolete_options(pseudo_inv_solver, project_on_V):
+    if pseudo_inv_solver is not None:
+        warnings.warn(
+            "pseudo_inv_solver is obsolete and ignored: the corrected method "
+            "needs neither GMRES nor CG; only nonuniform weights use a cached "
+            "Laplacian pseudoinverse.",
+            DeprecationWarning, stacklevel=3,
+        )
+    if project_on_V is not None:
+        warnings.warn(
+            "project_on_V is obsolete and ignored: the corrected update "
+            "already yields the centered pseudoinverse solution.",
+            DeprecationWarning, stacklevel=3,
+        )
+
+
+def _prepare_smacof(D, W, alpha, n_components):
+    """Cache quantities common to all iterations and random restarts.
+
+    Private implementation detail: ``_smacof_single`` can also prepare these
+    quantities itself when called directly, just like scikit-learn's helper.
+    """
+    n_samples = len(D)
+    weighted_symmetric_D = W * (D + D.T) / 2
+    C = np.zeros((n_samples, n_components), dtype=float)
+    C[:, -1] = alpha * (W * (D - D.T)).sum(axis=1)
+
+    # Handle n=1 and the entirely zero-weight graph without a pseudoinverse.
+    uniform_weight = None
+    V_pinv = None
+    if np.any(W):
+        off_diagonal = W[~np.eye(n_samples, dtype=bool)]
+        if np.all(off_diagonal == off_diagonal[0]):
+            uniform_weight = float(off_diagonal[0])
+        else:
+            V = np.diag(W.sum(axis=1)) - W
+            V_pinv = np.linalg.pinv(V, hermitian=True)
+
+    return D, W, weighted_symmetric_D, C, uniform_weight, V_pinv
+
+
+def _directed_stress(X, distances, D, W, alpha):
+    """Sum over *both* orientations (i,j) with the Randers distance."""
+    drift = alpha * X[:, -1]
+    finsler_distances = distances + drift[None, :] - drift[:, None]
+    return float(np.sum(W * (finsler_distances - D)**2))
 
 
 def _smacof_single(
     dissimilarities,
-    randers_w_alpha=0.,
+    randers_w_alpha=0.0,
     metric=True,
     n_components=2,
     init=None,
@@ -29,262 +146,106 @@ def _smacof_single(
     random_state=None,
     normalized_stress=False,
     weight=None,
-    pseudo_inv_solver="gmres",
-    project_on_V=False,
+    pseudo_inv_solver=None,
+    project_on_V=None,
     check_monotony=True,
+    *,
+    _prepared=None,
 ):
-    """Computes Finsler multidimensional scaling using SMACOF algorithm.
+    """Run a *single* corrected Finsler SMACOF initialization.
 
-    Parameters
-    ----------
-    dissimilarities : ndarray of shape (n_samples, n_samples)
-        Pairwise dissimilarities between the points. No longer symmetric.
-
-    randers_w_alpha : float, default=0.
-        Weighting factor for the drift component of the Randers metric.
-        If 0., the metric is the Euclidean metric.
-        Must be in the range [0, 1).
-
-    metric : bool, default=True
-        Compute metric or nonmetric SMACOF algorithm.
-        When ``False`` (i.e. non-metric MDS), dissimilarities with 0 are considered as
-        missing values. Non-metric weighted MDS is not implemented.
-
-    n_components : int, default=2
-        Number of dimensions in which to immerse the dissimilarities. If an
-        ``init`` array is provided, this option is overridden and the shape of
-        ``init`` is used to determine the dimensionality of the embedding
-        space.
-
-    init : ndarray of shape (n_samples, n_components), default=None
-        Starting configuration of the embedding to initialize the algorithm. By
-        default, the algorithm is initialized with a randomly chosen array.
-
-    max_iter : int, default=300
-        Maximum number of iterations of the SMACOF algorithm for a single run.
-
-    verbose : int, default=0
-        Level of verbosity.
-
-    eps : float, default=1e-3
-        Relative tolerance with respect to stress at which to declare
-        convergence. The value of `eps` should be tuned separately depending
-        on whether or not `normalized_stress` is being used.
-
-    random_state : int, RandomState instance or None, default=None
-        Determines the random number generator used to initialize the centers.
-        Pass an int for reproducible results across multiple function calls.
-        See :term:`Glossary <random_state>`.
-
-    normalized_stress : bool, default=False
-        Whether use and return normed stress value (Stress-1) instead of raw
-        stress calculated by default. Only supported in non-metric MDS. The
-        caller must ensure that if `normalized_stress=True` then `metric=False`
-
-    weight : ndarray of shape (n_samples, n_samples), default=None
-        symmetric weighting matrix of similarities.
-        In default, weight is set to None, suggesting all weights are 1.
-
-    pseudo_inv_solver : str, default="gmres"
-        Can be any of ["gmres", "cg", "pinv"]. Defines how to compute
-        the pseudo-inverse.
-
-    project_on_V : bool, default=True
-        Whether to project the points on the V space or not.
-
-    check_monotony: bool, default=True
-        Whether to check the monotony of the stress value and break if not.
-        The stress should decrease but due to approximations it can increase.
-        Set check_monotony=False if the stress increases in the first iterations
-        and instead run for a fixed amount of iterations.
-
-    Returns
-    -------
-    X : ndarray of shape (n_samples, n_components)
-        Coordinates of the points in a ``n_components``-space.
-
-    stress : float
-        The final value of the stress (sum of squared distance of the
-        disparities and the distances for all constrained points).
-
-    n_iter : int
-        The number of iterations corresponding to the best stress.
+    Returns (embedding, raw directed stress, number of completed updates).
+    ``_prepared`` is private, supplied by ``smacof`` to reuse V^+ across
+    random starts. Direct calls to this function require no such argument.
     """
+    _warn_obsolete_options(pseudo_inv_solver, project_on_V)
+    if init is not None:
+        init = np.asarray(init, dtype=float)
+        if init.ndim != 2:
+            raise ValueError("init must be a two-dimensional array")
+        n_components = init.shape[1]  # Same dimension override as sklearn.
+    _validate_options(randers_w_alpha, metric, normalized_stress,
+                      n_components, max_iter, eps)
 
-    assert 0 <= randers_w_alpha < 1
-
-    if weight is None:
-        weight = np.ones_like(dissimilarities)  # Quick fix to have code flexibility compared to dirty source code
-
-    n_samples = dissimilarities.shape[0]
-    random_state = check_random_state(random_state)
-
-    if init is None:
-        # Randomly choose initial configuration
-        X = random_state.uniform(size=n_samples * n_components)
-        X = X.reshape((n_samples, n_components))
+    if _prepared is None:
+        D = _validate_dissimilarities(dissimilarities)
+        W = _validate_weights(weight, len(D))
+        prepared = _prepare_smacof(D, W, randers_w_alpha, n_components)
     else:
-        # overrides the parameter p
-        n_components = init.shape[1]
-        if n_samples != init.shape[0]:
-            raise ValueError(
-                "init matrix should be of shape (%d, %d)" % (n_samples, n_components)
-            )
-        X = init
+        prepared = _prepared
+    D, W, weighted_symmetric_D, C, uniform_weight, V_pinv = prepared
+    n_samples = len(D)
 
-    if weight is not None:
-        V = -weight.copy()
-        V[np.arange(len(V)), np.arange(len(V))] = 0
-        V[np.arange(len(V)), np.arange(len(V))] += np.abs(V.sum(axis=1))
-        # V_pinv = np.linalg.pinv(V)  # For Vanilla non-Finsler smacof
+    random_state = check_random_state(random_state)
+    if init is None:
+        X = random_state.uniform(size=(n_samples, n_components))
+    else:
+        if init.shape != (n_samples, n_components) or not np.all(np.isfinite(init)):
+            raise ValueError("init must have shape (n_samples, n_components) and be finite")
+        X = init.copy()  # Do not modify a caller-owned initial configuration.
 
-        diag_one_end = np.zeros((n_components, n_components))
-        diag_one_end[-1, -1] = 1
-        diag_sum_weights = np.diag(weight.sum(axis=1))
-        A = (-randers_w_alpha * weight + randers_w_alpha * diag_sum_weights)
-
-        if metric:
-            disparities = dissimilarities
-        else:
-            raise ValueError("Non-metric MDS is not implemented yet.")
-        mat_one_last_col = np.zeros((X.shape[0], X.shape[1]))
-        mat_one_last_col[:, -1] = 1
-        C = randers_w_alpha * ((weight * disparities - weight.T * disparities.T)) @ mat_one_last_col
-
-    old_X = X.copy()
-    old_stress = None
-    ir = IsotonicRegression()
-    print()
+    # As in sklearn, the single-run helper owns the entire iteration loop.
+    distances = euclidean_distances(X)
+    stress = _directed_stress(X, distances, D, W, randers_w_alpha)
+    n_iter = 0
     for it in range(max_iter):
-        # print('iteration', it)
-        print('\r', it, end='')
-        # Compute distance and monotonic regression
-        if randers_w_alpha > 0:
-            embedded_dissimilarity_func = canonical_randers_dissimilarity(randers_w_alpha)
-        else:
-            embedded_dissimilarity_func = euclidean_distances
-        dis = embedded_dissimilarity_func(X)
+        # The B matrix uses symmetric data D_S and *Euclidean* distances,
+        # not asymmetric Finsler distances. Exact coincidence implies B_ij=0.
+        B = np.zeros_like(D)
+        np.divide(-weighted_symmetric_D, distances, out=B,
+                  where=distances > 0)
+        np.fill_diagonal(B, 0.0)
+        B[np.arange(n_samples), np.arange(n_samples)] = -B.sum(axis=1)
 
-        if metric:
-            disparities = dissimilarities
+        rhs = B @ X - 0.5 * C
+        if uniform_weight is not None:
+            X_new = rhs / (n_samples * uniform_weight)
+        elif V_pinv is not None:
+            X_new = V_pinv @ rhs
         else:
-            # dis_flat = dis.ravel()
-            # # dissimilarities with 0 are considered as missing values
-            # dis_flat_w = dis_flat[sim_flat != 0]
-            #
-            # # Compute the disparities using a monotonic regression
-            # disparities_flat = ir.fit_transform(sim_flat_w, dis_flat_w)
-            # disparities = dis_flat.copy()
-            # disparities[sim_flat != 0] = disparities_flat
-            # disparities = disparities.reshape((n_samples, n_samples))
-            # disparities *= np.sqrt(
-            #     (n_samples * (n_samples - 1) / 2) / (disparities**2).sum()
-            # )
-            raise ValueError("Non-metric MDS is not implemented yet.")
+            # No constrained pairs: the componentwise-centered solution is 0.
+            X_new = np.zeros_like(X)
 
-        # Compute stress
-        stress = (weight.ravel() * (dis.ravel() - disparities.ravel()) ** 2).sum()  # / 2
-        if normalized_stress:
-            stress = np.sqrt(
-                stress / ((weight.ravel() * disparities.ravel() ** 2).sum())  # / 2)
+        # (I + omega omega.T)^(-1): omega=(0,...,0,alpha), so only the
+        # last embedding coordinate is rescaled.
+        X_new[:, -1] /= 1 + randers_w_alpha**2
+
+        distances_new = euclidean_distances(X_new)
+        stress_new = _directed_stress(
+            X_new, distances_new, D, W, randers_w_alpha
+        )
+        if not np.isfinite(stress_new):
+            raise FloatingPointError("non-finite stress in Finsler SMACOF")
+
+        if check_monotony and stress_new > stress + 1e-10 * max(1.0, stress):
+            warnings.warn(
+                "Finsler stress increased beyond numerical tolerance; "
+                "retaining the previous iterate.", RuntimeWarning, stacklevel=2
             )
-        # Update X using the finsler-smacof algorithm update
-        dis[dis == 0] = 1e-5
-        ratio = disparities / dis
-        if weight is None:
-            B = -ratio
-        else:
-            B = -ratio * weight
-        B[np.arange(len(B)), np.arange(len(B))] += -B.sum(axis=1)
-        if weight is None:
-            X = 1.0 / n_samples * np.dot(B, X)
-            # TODO: deal with this case
-        else:
-            if randers_w_alpha == None:
-                X = np.linalg.pinv(V) @ B @ X
-            else:
-                # Vanilla Finsler smacof: tends to struggle to compute the pseudo inverse
-                # left_mat @ X + left_mat_2 @ X @ right_mat = total_right_mat
+            break
 
-                left_mat = V
-                left_mat_2 = A
-                right_mat = diag_one_end
-                total_right_mat = B @ X - C
-                if project_on_V:
-                    left_mat = V.T @ left_mat
-                    left_mat_2 = V.T @ left_mat_2
-                    total_right_mat = V.T @ total_right_mat
-                I_kron_left_mat = scipy.sparse.csr_array(np.kron(np.eye(*right_mat.shape), left_mat))
-                right_mat_T_kron_I = scipy.sparse.csr_array(np.kron(right_mat.T, left_mat_2))
-                if pseudo_inv_solver == "pinv":
-                    X_flat = scipy.linalg.pinv((I_kron_left_mat + right_mat_T_kron_I).todense()) @ (total_right_mat.flatten(order='F'))
-                elif pseudo_inv_solver == "cg":  # similar to gmres
-                    X_flat, _ = scipy.sparse.linalg.cg((I_kron_left_mat + right_mat_T_kron_I), total_right_mat.flatten(order='F'))
-                elif pseudo_inv_solver == "gmres":
-                    X_flat, _ = scipy.sparse.linalg.gmres((I_kron_left_mat + right_mat_T_kron_I), total_right_mat.flatten(order='F'))
-                else:
-                    raise ValueError("Unknown pseudo-inverse solver")
-                X = X_flat.reshape((n_samples, n_components), order='F')
-
-        if weight is None:
-            weight = np.ones(disparities.shape)
-
-        if not metric:
-            dis = np.sqrt((X**2).sum(axis=1)).sum()
-        else:
-            dis = 1
+        improvement = stress - stress_new
+        X, distances, stress = X_new, distances_new, stress_new
+        n_iter = it + 1
         if verbose >= 2:
-            print("it: %d, stress %s" % (it, stress))
-        if old_stress is not None:
-            print('', (old_stress - stress / dis), end='')
-            # if (old_stress - stress / dis) < eps:
-            if check_monotony:
-                if stress > old_stress + 0.1:  # Instability occurred making the stress increase, the algorithm will then diverge
-                    X = old_X
-                    stress = old_stress
-                    it -= 1
-                    if verbose:
-                        print("\rbreaking at iteration %d with stress %s due to stress increase" % (it, stress))
-                    break
-                if np.abs(1 - stress / old_stress) < eps:
-                    if verbose:
-                        print("\rbreaking at iteration %d with stress %s" % (it, stress))
-                    break
-        if not metric:
-            old_stress = stress / dis
-        else:
-            old_stress = stress
-        old_X = X.copy()
-    print()
+            print(f"Finsler SMACOF iteration {n_iter}: stress={stress:.12g}")
 
-    return X, stress, it + 1
+        # Legacy check_monotony=False explicitly requested fixed iterations.
+        # Keep that behavior, rather than stopping early on eps.
+        if check_monotony and improvement <= eps * max(
+            stress + improvement, 1e-12
+        ):
+            if verbose:
+                print(f"Finsler SMACOF converged at iteration {n_iter}")
+            break
+
+    return X, stress, n_iter
 
 
-@validate_params(
-    {
-        "dissimilarities": ["array-like"],
-        "randers_w_alpha": [Real],
-        "n_components": [Interval(Integral, 1, None, closed="left")],
-        "init": ["array-like", None],
-        "n_init": [Interval(Integral, 1, None, closed="left")],
-        "n_jobs": [Integral, None],
-        "max_iter": [Interval(Integral, 1, None, closed="left")],
-        "verbose": ["verbose"],
-        "eps": [Interval(Real, 0, None, closed="left")],
-        "random_state": ["random_state"],
-        "return_n_iter": ["boolean"],
-        "normalized_stress": [
-            "boolean",
-            StrOptions({"auto"}),
-            Hidden(StrOptions({"warn"})),
-        ],
-    },
-    prefer_skip_nested_validation=True,
-)
 def smacof(
     dissimilarities,
     *,
-    randers_w_alpha=0.,
+    randers_w_alpha=0.0,
     metric=True,
     n_components=2,
     init=None,
@@ -297,214 +258,80 @@ def smacof(
     return_n_iter=False,
     normalized_stress="warn",
     weight=None,
-    pseudo_inv_solver="gmres",
-    project_on_V=False,
+    pseudo_inv_solver=None,
+    project_on_V=None,
     check_monotony=True,
 ):
-    """Compute Finsler multidimensional scaling using the SMACOF algorithm.
+    """Minimize canonical-Randers stress with corrected metric SMACOF.
 
-    The SMACOF (Scaling by MAjorizing a COmplicated Function) algorithm is a
-    multidimensional scaling algorithm which minimizes an objective function
-    (the *stress*) using a majorization technique. Stress majorization, also
-    known as the Guttman Transform, guarantees a monotone convergence of
-    stress, and is more powerful than traditional techniques such as gradient
-    descent.
+    Matches the original FinslerMDS ``smacof`` call signature: the default
+    return is **two** values ``(embedding, stress)``. Setting
+    ``return_n_iter=True`` adds the third value ``n_iter``. Supplied ``init``
+    overrides ``n_components`` and causes a single optimization run.
 
-    The SMACOF algorithm for metric MDS can be summarized by the following
-    steps:
+    ``weight`` is a symmetric nonnegative NxN pair-weight matrix (diagonal
+    ignored); ``None`` means uniform unit weights. ``metric=False`` and
+    ``normalized_stress=True`` are unsupported, as in the original metric
+    Finsler implementation. Deprecated solver options are accepted but ignored.
 
-    1. Set an initial start configuration, randomly or not.
-    2. Compute the stress
-    3. Compute the Guttman Transform
-    4. Iterate 2 and 3 until convergence.
+    For ``check_monotony=True``, iteration stops upon relative stress
+    convergence or an unexpected numerical stress increase. When False, it
+    executes exactly ``max_iter`` iterations (legacy fixed-iteration behavior).
 
-    The nonmetric algorithm adds a monotonic regression step before computing
-    the stress.
-
-    Parameters
-    ----------
-    dissimilarities : array-like of shape (n_samples, n_samples)
-        Pairwise dissimilarities between the points. Must be symmetric.
-
-    randers_w_alpha : float, default=0.
-        Weighting factor for the drift component of the Randers metric.
-        If 0., the metric is the Euclidean metric.
-        Must be in the range [0, 1).
-
-    metric : bool, default=True
-        Compute metric or nonmetric SMACOF algorithm.
-        When ``False`` (i.e. non-metric MDS), dissimilarities with 0 are considered as
-        missing values.
-
-    n_components : int, default=2
-        Number of dimensions in which to immerse the dissimilarities. If an
-        ``init`` array is provided, this option is overridden and the shape of
-        ``init`` is used to determine the dimensionality of the embedding
-        space.
-
-    init : array-like of shape (n_samples, n_components), default=None
-        Starting configuration of the embedding to initialize the algorithm. By
-        default, the algorithm is initialized with a randomly chosen array.
-
-    n_init : int, default=8
-        Number of times the SMACOF algorithm will be run with different
-        initializations. The final results will be the best output of the runs,
-        determined by the run with the smallest final stress. If ``init`` is
-        provided, this option is overridden and a single run is performed.
-
-    n_jobs : int, default=None
-        The number of jobs to use for the computation. If multiple
-        initializations are used (``n_init``), each run of the algorithm is
-        computed in parallel.
-
-        ``None`` means 1 unless in a :obj:`joblib.parallel_backend` context.
-        ``-1`` means using all processors. See :term:`Glossary <n_jobs>`
-        for more details.
-
-    max_iter : int, default=300
-        Maximum number of iterations of the SMACOF algorithm for a single run.
-
-    verbose : int, default=0
-        Level of verbosity.
-
-    eps : float, default=1e-3
-        Relative tolerance with respect to stress at which to declare
-        convergence. The value of `eps` should be tuned separately depending
-        on whether or not `normalized_stress` is being used.
-
-    random_state : int, RandomState instance or None, default=None
-        Determines the random number generator used to initialize the centers.
-        Pass an int for reproducible results across multiple function calls.
-        See :term:`Glossary <random_state>`.
-
-    return_n_iter : bool, default=False
-        Whether or not to return the number of iterations.
-
-    normalized_stress : bool or "auto" default=False
-        Whether use and return normed stress value (Stress-1) instead of raw
-        stress calculated by default. Only supported in non-metric MDS.
-
-    weight : ndarray of shape (n_samples, n_samples), default=None
-        symmetric weighting matrix of similarities.
-        In default, weight is set to None, suggesting all weights are 1.
-
-    pseudo_inv_solver : str, default="gmres"
-        Can be any of ["gmres", "cg", "pinv"]. Defines how to compute
-        the pseudo-inverse.
-
-    project_on_V : bool, default=False
-        Whether to project the points on the V space or not.
-
-    check_monotony: bool, default=True
-        Whether to check the monotony of the stress value and break if not.
-        The stress should decrease but due to approximations it can increase.
-        Set check_monotony=False if the stress increases in the first iterations
-        and instead run for a fixed amount of iterations.
-
-    Returns
-    -------
-    X : ndarray of shape (n_samples, n_components)
-        Coordinates of the points in a ``n_components``-space.
-
-    stress : float
-        The final value of the stress (sum of squared distance of the
-        disparities and the distances for all constrained points).
-        If `normalized_stress=True`, and `metric=False` returns Stress-1.
-        A value of 0 indicates "perfect" fit, 0.025 excellent, 0.05 good,
-        0.1 fair, and 0.2 poor [1]_.
-
-    n_iter : int
-        The number of iterations corresponding to the best stress. Returned
-        only if ``return_n_iter`` is set to ``True``.
-
-    References
-    ----------
-    .. [1] "Nonmetric multidimensional scaling: a numerical method" Kruskal, J.
-           Psychometrika, 29 (1964)
-
-    .. [2] "Multidimensional scaling by optimizing goodness of fit to a nonmetric
-           hypothesis" Kruskal, J. Psychometrika, 29, (1964)
-
-    .. [3] "Modern Multidimensional Scaling - Theory and Applications" Borg, I.;
-           Groenen P. Springer Series in Statistics (1997)
+    See Appendix C of *Harnessing Data Asymmetry in Manifold Learning*
+    (NeurIPS 2026) for the corrected update and its monotonicity proof.
     """
+    _warn_obsolete_options(pseudo_inv_solver, project_on_V)
+    if not isinstance(n_init, (int, np.integer)) or n_init < 1:
+        raise ValueError("n_init must be a positive integer")
+    if init is not None:
+        init = np.asarray(init, dtype=float)
+        if init.ndim != 2:
+            raise ValueError("init must be a two-dimensional array")
+        n_components = init.shape[1]
+        if n_init != 1:
+            warnings.warn(
+                "Explicit initial positions passed: performing only one "
+                f"initialization instead of {n_init}.", UserWarning,
+                stacklevel=2,
+            )
+        n_init = 1
 
-    dissimilarities = check_array(dissimilarities)
+    _validate_options(randers_w_alpha, metric, normalized_stress,
+                      n_components, max_iter, eps)
+    D = _validate_dissimilarities(dissimilarities)
+    W = _validate_weights(weight, len(D))
+    prepared = _prepare_smacof(D, W, randers_w_alpha, n_components)
     random_state = check_random_state(random_state)
 
-    # TODO(1.4): Remove
-    if normalized_stress == "warn":
-        warnings.warn(
-            (
-                "The default value of `normalized_stress` will change to `'auto'` in"
-                " version 1.4. To suppress this warning, manually set the value of"
-                " `normalized_stress`."
-            ),
-            FutureWarning,
-        )
-        normalized_stress = False
-
-    if normalized_stress == "auto":
-        normalized_stress = not metric
-
-    if normalized_stress and metric:
-        raise ValueError(
-            "Normalized stress is not supported for metric MDS. Either set"
-            " `normalized_stress=False` or use `metric=False`."
-        )
-    if hasattr(init, "__array__"):
-        init = np.asarray(init).copy()
-        if not n_init == 1:
-            warnings.warn(
-                "Explicit initial positions passed: "
-                "performing only one init of the MDS instead of %d" % n_init
-            )
-            n_init = 1
-
-    best_pos, best_stress = None, None
-
+    # Same two-level structure as sklearn: smacof selects the best of
+    # n_init calls to _smacof_single, which owns the iteration itself.
+    best_pos, best_stress, best_iter = None, None, None
     if effective_n_jobs(n_jobs) == 1:
-        for it in range(n_init):
-            pos, stress, n_iter_ = _smacof_single(dissimilarities,
-                                                  randers_w_alpha=randers_w_alpha,
-                                                  metric=metric, n_components=n_components, init=init,
-                                                  max_iter=max_iter, verbose=verbose, eps=eps,
-                                                  random_state=random_state, normalized_stress=normalized_stress,
-                                                  weight=weight,
-                                                  pseudo_inv_solver=pseudo_inv_solver, project_on_V=project_on_V,
-                                                  check_monotony=check_monotony)
+        for _ in range(n_init):
+            pos, stress, n_iter_ = _smacof_single(
+                D, randers_w_alpha=randers_w_alpha, metric=metric,
+                n_components=n_components, init=init, max_iter=max_iter,
+                verbose=verbose, eps=eps, random_state=random_state,
+                normalized_stress=normalized_stress, weight=W,
+                check_monotony=check_monotony, _prepared=prepared,
+            )
             if best_stress is None or stress < best_stress:
-                best_stress = stress
-                best_pos = pos.copy()
-                best_iter = n_iter_
+                best_pos, best_stress, best_iter = pos.copy(), stress, n_iter_
     else:
         seeds = random_state.randint(np.iinfo(np.int32).max, size=n_init)
         results = Parallel(n_jobs=n_jobs, verbose=max(verbose - 1, 0))(
             delayed(_smacof_single)(
-                dissimilarities,
-                randers_w_alpha=randers_w_alpha,
-                metric=metric,
-                n_components=n_components,
-                init=init,
-                max_iter=max_iter,
-                verbose=verbose,
-                eps=eps,
-                random_state=seed,
-                normalized_stress=normalized_stress,
-                weight=weight,
-                pseudo_inv_solver=pseudo_inv_solver,
-                project_on_V=project_on_V,
-                check_monotony=check_monotony,
+                D, randers_w_alpha=randers_w_alpha, metric=metric,
+                n_components=n_components, init=init, max_iter=max_iter,
+                verbose=verbose, eps=eps, random_state=seed,
+                normalized_stress=normalized_stress, weight=W,
+                check_monotony=check_monotony, _prepared=prepared,
             )
             for seed in seeds
         )
-        positions, stress, n_iters = zip(*results)
-        best = np.argmin(stress)
-        best_stress = stress[best]
-        best_pos = positions[best]
-        best_iter = n_iters[best]
+        best_pos, best_stress, best_iter = min(results, key=lambda r: r[1])
 
     if return_n_iter:
         return best_pos, best_stress, best_iter
-    else:
-        return best_pos, best_stress
+    return best_pos, best_stress
